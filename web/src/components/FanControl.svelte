@@ -210,12 +210,18 @@
         selections: string[] | null,
     ): number | null {
         let best: number | null = null;
-
-        if (selections && selections.length > 0) {
-            for (const s of selections) {
-                const t = temps[s];
-                if (!Number.isNaN(t)) {
-                    best = Math.max(best ?? 0, t);
+        for (const s of selections ?? []) {
+            const t = temps[s];
+            if (typeof t === "number" && !Number.isNaN(t)) {
+                best = Math.max(best ?? t, t);
+            }
+        }
+        // Like the service: if no selected sensor exists (e.g. renamed by a
+        // framework_tool update), fall back to the max across all sensors.
+        if (best == null) {
+            for (const t of Object.values(temps ?? {})) {
+                if (typeof t === "number" && !Number.isNaN(t)) {
+                    best = Math.max(best ?? t, t);
                 }
             }
         }
@@ -421,13 +427,17 @@
                 });
             });
         }
-        if (
-            $configStore.loaded &&
-            selectedSensors.length === 0 &&
-            availableSensors.length > 0
-        ) {
-            selectedSensors = availableSensors.slice();
-            save();
+        if ($configStore.loaded && availableSensors.length > 0) {
+            // Drop sensors that no longer exist (framework_tool updates can
+            // rename them); select all if nothing valid remains.
+            const valid = selectedSensors.filter((s) =>
+                availableSensors.includes(s),
+            );
+            const next = valid.length > 0 ? valid : availableSensors.slice();
+            if (next.length !== selectedSensors.length) {
+                selectedSensors = next;
+                save();
+            }
         }
         onMountComplete = true;
     });
@@ -833,11 +843,17 @@
         return "text-success";
     }
 
-    // Track which selected sensor is currently the max
+    // Track which selected sensor is currently the max (all sensors if none
+    // of the selected ones exist, matching pickTempForSelection).
     $: (function computeSelectedMaxSensor() {
         let bestName: string | null = null;
         let best: number | null = null;
-        for (const s of selectedSensors) {
+        const present = selectedSensors.filter(
+            (s) => typeof latestTemps?.[s] === "number",
+        );
+        for (const s of present.length > 0
+            ? present
+            : Object.keys(latestTemps ?? {})) {
             const t = latestTemps?.[s];
             if (typeof t === "number" && !Number.isNaN(t)) {
                 if (best == null || t > best) {
@@ -1011,7 +1027,9 @@
                                 {/each}
                             {:else}
                                 <span class="text-sm opacity-70">
-                                    {latestTemps?.[selectedMaxSensor ?? ""]} °C • {rpmToPercent(
+                                    {selectedMaxSensor != null
+                                        ? latestTemps[selectedMaxSensor]
+                                        : "—"} °C • {rpmToPercent(
                                         liveRpm ?? 0,
                                         liveFanIndex,
                                     )}%

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use tokio::time::{sleep, Duration};
@@ -288,25 +288,30 @@ async fn ensure_fan_count(cli: &FrameworkTool, cached: &mut Option<u32>) -> Opti
 /// Read thermal and return the maximum temperature across the provided sensors.
 async fn get_max_sensor_temperature(cli: &FrameworkTool, sensors: &[String]) -> Option<i32> {
     let output = cli.thermal().await.ok()?;
-    let temps = &output.temps;
-    let mut best: Option<i32> = None;
-    for name in sensors {
-        if let Some(&v) = temps.get(name) {
-            best = Some(match best {
-                Some(b) => b.max(v),
-                None => v,
-            });
-            continue;
+    max_sensor_temperature(&output.temps, sensors)
+}
+
+/// Max temperature across `sensors` (exact name, then case-insensitive match).
+/// If none of the selected sensors exist (e.g. framework_tool renamed them, or
+/// the selection is empty), fall back to the max across all sensors so the
+/// curve keeps controlling the fans instead of silently stalling.
+fn max_sensor_temperature(temps: &BTreeMap<String, i32>, sensors: &[String]) -> Option<i32> {
+    let selected = sensors
+        .iter()
+        .filter_map(|name| {
+            temps
+                .get(name)
+                .or_else(|| temps.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v))
+                .copied()
+        })
+        .max();
+    selected.or_else(|| {
+        let fallback = temps.values().copied().max();
+        if fallback.is_some() {
+            debug!("No selected sensor found ({:?}); using max of all sensors", sensors);
         }
-        if let Some((_, v)) = temps.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
-            let v = *v;
-            best = Some(match best {
-                Some(b) => b.max(v),
-                None => v,
-            });
-        }
-    }
-    best
+        fallback
+    })
 }
 
 /// Calculate fan duty from temperature using the curve points
@@ -356,6 +361,39 @@ fn apply_rate_limit(current: u32, target: u32, max_change: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temps(pairs: &[(&str, i32)]) -> BTreeMap<String, i32> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn max_sensor_temperature_uses_selected_sensors() {
+        let t = temps(&[("apu_f75303@4d", 51), ("cpu@4c", 61), ("gpu_temp@40", 70)]);
+        assert_eq!(
+            max_sensor_temperature(&t, &names(&["apu_f75303@4d", "cpu@4c"])),
+            Some(61)
+        );
+        assert_eq!(max_sensor_temperature(&t, &names(&["CPU@4C"])), Some(61));
+    }
+
+    #[test]
+    fn max_sensor_temperature_ignores_missing_when_some_match() {
+        let t = temps(&[("apu_f75303@4d", 51), ("cpu@4c", 61), ("gpu_temp@40", 70)]);
+        assert_eq!(max_sensor_temperature(&t, &names(&["APU", "cpu@4c"])), Some(61));
+    }
+
+    #[test]
+    fn max_sensor_temperature_falls_back_when_selection_is_stale() {
+        // framework_tool 0.6.6 renamed sensors (e.g. "APU" -> "apu_f75303@4d").
+        let t = temps(&[("apu_f75303@4d", 51), ("cpu@4c", 61), ("gpu_temp@40", 39)]);
+        assert_eq!(max_sensor_temperature(&t, &names(&["APU", "F75303_CPU"])), Some(61));
+        assert_eq!(max_sensor_temperature(&t, &[]), Some(61));
+        assert_eq!(max_sensor_temperature(&BTreeMap::new(), &names(&["APU"])), None);
+    }
 
     #[test]
     fn test_calculate_duty_from_curve() {
